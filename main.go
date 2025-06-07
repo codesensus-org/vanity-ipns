@@ -100,7 +100,7 @@ func generateKey(suffix string, privKeyChan chan crypto.PrivKey, benchChan chan 
 
 		fmt.Println(keyStr)
 
-		privKeyBytes, err := privKey.Raw()
+		privKeyBytes, err := crypto.MarshalPrivateKey(privKey)
 		if err != nil {
 			log.Fatal(err)
 		}
