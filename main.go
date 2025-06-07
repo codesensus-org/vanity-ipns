@@ -5,91 +5,112 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
-	"github.com/libp2p/go-libp2p-crypto"
-	"github.com/libp2p/go-libp2p-peer"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multibase"
 )
 
 var (
-	alphabet   = regexp.MustCompile("^[123456789abcdefghijklmnopqrstuvwxyz]+$")
-	numWorkers = runtime.NumCPU()
+	alphabet = regexp.MustCompile("^[0-9a-z]+$")
+	workers  = runtime.NumCPU()
 )
 
-// Key stores PrettyID containing desired substring at Index
-type Key struct {
-	PrettyID string
-	Index    int
-}
+const BENCHMARK_INTERVAL = 100_000
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Printf(`
-This tool generates IPFS public and private keypair until it finds public key
-which contains required substring. Keys are stored in local directory. If you
-like one of them, you can move it to ~/.ipfs/keystore/ to use it with IPFS.
-
-Usage:
-	%s {part}
-		For fast results suggested length of public key part is 4-5 characters
-`, os.Args[0])
+		fmt.Printf("Usage: %s {suffix}\n", os.Args[0])
 		os.Exit(1)
 	}
-	part := strings.ToLower(os.Args[1])
-	if !alphabet.MatchString(part) {
-		fmt.Println("{part} must match the alphabet:", alphabet.String())
+
+	suffix := strings.ToLower(os.Args[1])
+	if !alphabet.MatchString(suffix) {
+		fmt.Println("Invalid characters")
 		os.Exit(2)
 	}
-	runtime.GOMAXPROCS(numWorkers)
-	keyChan := make(chan Key)
-	for i := 0; i < numWorkers; i++ {
+
+	if len(suffix) > 8 {
+		fmt.Println("Suffix too long, 9+ characters would take years to find")
+		os.Exit(3)
+	}
+
+	runtime.GOMAXPROCS(workers)
+
+	privKeyChan := make(chan crypto.PrivKey)
+	benchChan := make(chan int)
+
+	for i := 0; i < workers; i++ {
 		go func() {
-			err := generateKey(part, keyChan)
+			err := generateKey(suffix, privKeyChan, benchChan)
 			if err != nil {
 				log.Fatal(err)
 			}
 		}()
 	}
-	for key := range keyChan {
-		fmt.Printf(
-			"%s\u001b[32m%s\u001b[0m%s\n",
-			key.PrettyID[:key.Index],
-			key.PrettyID[key.Index:len(part)+key.Index],
-			key.PrettyID[len(part)+key.Index:])
 
-	}
+	go func() {
+		expectedCount := math.Pow(36, float64(len(suffix)))
+
+		start := time.Now()
+
+		count := 0
+		for range benchChan {
+			count += 1
+
+			if count%workers == 0 {
+				delta := time.Now().Sub(start).Seconds()
+				ops := float64(count * BENCHMARK_INTERVAL)
+				opsPerSec := ops / delta
+				eta := time.Duration(delta * expectedCount / ops * float64(time.Second))
+				log.Printf("Benchmark: %.f keys per second - ETA: %s\n", opsPerSec, eta.Round(time.Second))
+			}
+		}
+	}()
+
+	<-privKeyChan
 }
 
-func generateKey(part string, keyChan chan Key) error {
-	for {
-		privateKey, publicKey, err := crypto.GenerateEd25519Key(rand.Reader)
+func generateKey(suffix string, privKeyChan chan crypto.PrivKey, benchChan chan int) error {
+	for i := 1; ; i += 1 {
+		privKey, pubKey, err := crypto.GenerateEd25519Key(rand.Reader)
 		if err != nil {
 			return err
 		}
-		peerID, err := peer.IDFromPublicKey(publicKey)
+
+		id, err := peer.IDFromPublicKey(pubKey)
 		if err != nil {
 			return err
 		}
-		prettyID := peerID.Pretty()
-		lowerID := strings.ToLower(prettyID)
-		idx := strings.Index(lowerID, part)
-		if idx == -1 {
+
+		keyStr, err := peer.ToCid(id).StringOfBase(multibase.Base36)
+		if !strings.HasSuffix(strings.ToLower(keyStr), suffix) {
+			if i%BENCHMARK_INTERVAL == 0 {
+				benchChan <- 1
+			}
+
 			continue
 		}
-		privateKeyBytes, err := privateKey.Bytes()
+
+		fmt.Println(keyStr)
+
+		privKeyBytes, err := privKey.Raw()
 		if err != nil {
-			return err
+			log.Fatal(err)
 		}
-		err = ioutil.WriteFile(prettyID, privateKeyBytes, 0600)
+
+		err = ioutil.WriteFile(keyStr, privKeyBytes, 0600)
 		if err != nil {
-			return err
+			log.Fatal(err)
 		}
-		keyChan <- Key{
-			PrettyID: prettyID,
-			Index:    idx,
-		}
+
+		privKeyChan <- privKey
+		return nil
 	}
 }
